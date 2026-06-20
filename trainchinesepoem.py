@@ -42,10 +42,10 @@ TEST_SIZE = 1_000
 PROJECTION_DIM = 768
 INITIAL_TEMPERATURE = 0.07
 
-EPOCHS = 8
-TRAIN_BATCH_SIZE = 32
+EPOCHS = 10
+TRAIN_BATCH_SIZE = 128
 EVAL_BATCH_SIZE = 64
-GRAD_ACCUM_STEPS = 2
+GRAD_ACCUM_STEPS = 1
 
 ENCODER_LR = 1e-5
 HEAD_LR = 1e-4
@@ -228,6 +228,10 @@ class CLIPStyleCollator:
             "pixel_values": image_inputs["pixel_values"],
             "input_ids": text_inputs["input_ids"],
             "attention_mask": text_inputs["attention_mask"],
+
+            # Debug metadata; these are small lists of strings for the current batch only.
+            "image_paths": image_paths,
+            "texts": texts,
         }
 
         if "token_type_ids" in text_inputs:
@@ -399,7 +403,13 @@ def collect_embeddings(model: DINOv3BGECLIP, loader: DataLoader, device: torch.d
     all_text_embeds = []
 
     for batch in tqdm(loader, desc="Encoding", leave=False):
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        batch.pop("image_paths", None)
+        batch.pop("texts", None)
+
+        batch = {
+            k: v.to(device, non_blocking=True)
+            for k, v in batch.items()
+        }
 
         image_embeds, text_embeds = model(**batch)
 
@@ -422,14 +432,134 @@ def retrieval_metrics_from_logits(logits: torch.Tensor, prefix: str):
 
     metrics = {
         f"{prefix}_R@1": (ranks <= 1).float().mean().item(),
-        f"{prefix}_R@5": (ranks <= 5).float().mean().item(),
         f"{prefix}_R@10": (ranks <= 10).float().mean().item(),
+        f"{prefix}_R@50": (ranks <= 50).float().mean().item(),
+        f"{prefix}_R@100": (ranks <= 100).float().mean().item(),
+        f"{prefix}_R@250": (ranks <= 250).float().mean().item(),
+        f"{prefix}_R@500": (ranks <= 500).float().mean().item(),
         f"{prefix}_median_rank": ranks.median().item(),
         f"{prefix}_mean_rank": ranks.mean().item(),
     }
 
     return metrics
 
+@torch.no_grad()
+def inspect_bad_predictions_both(
+    model,
+    loader,
+    df,
+    device,
+    split_name="test",
+    top_k=10,
+    max_examples=20,
+):
+    image_embeds, text_embeds = collect_embeddings(model, loader, device)
+
+    image_embeds = image_embeds.to(device)
+    text_embeds = text_embeds.to(device)
+
+    logit_scale = model.logit_scale.exp().clamp(max=100.0).detach()
+    logits = logit_scale * image_embeds @ text_embeds.t()
+
+    return {
+        "i2t": inspect_direction_from_logits(
+            logits=logits,
+            df=df,
+            direction="i2t",
+            split_name=split_name,
+            top_k=top_k,
+            max_examples=max_examples,
+        ),
+        "t2i": inspect_direction_from_logits(
+            logits=logits.t(),
+            df=df,
+            direction="t2i",
+            split_name=split_name,
+            top_k=top_k,
+            max_examples=max_examples,
+        ),
+    }
+
+
+def inspect_direction_from_logits(
+    logits,
+    df,
+    direction,
+    split_name,
+    top_k,
+    max_examples,
+):
+    n = logits.size(0)
+    labels = torch.arange(n, device=logits.device)
+
+    sorted_indices = torch.argsort(logits, dim=1, descending=True)
+    ranks = (sorted_indices == labels[:, None]).nonzero(as_tuple=False)[:, 1] + 1
+
+    bad = torch.where(ranks > 1)[0]
+
+    results = []
+
+    for idx in bad[:max_examples]:
+        i = idx.item()
+        gt_rank = ranks[i].item()
+        gt_score = logits[i, i].item()
+
+        top_indices = sorted_indices[i, :top_k].detach().cpu().tolist()
+
+        if direction == "i2t":
+            item = {
+                "split": split_name,
+                "direction": "i2t",
+                "query_image_index": i,
+                "query_image_path": df.iloc[i]["resolved_image_path"],
+                "groundtruth_text": df.iloc[i][TEXT_COLUMN],
+                "groundtruth_rank": int(gt_rank),
+                "groundtruth_score": float(gt_score),
+                "top_text_predictions": [],
+            }
+
+            for rank, text_idx in enumerate(top_indices, start=1):
+                item["top_text_predictions"].append(
+                    {
+                        "rank": rank,
+                        "text_index": int(text_idx),
+                        "score": float(logits[i, text_idx].item()),
+                        "is_groundtruth": text_idx == i,
+                        "text": df.iloc[text_idx][TEXT_COLUMN],
+                        "matched_image_path_for_that_text": df.iloc[text_idx]["resolved_image_path"],
+                    }
+                )
+
+        elif direction == "t2i":
+            item = {
+                "split": split_name,
+                "direction": "t2i",
+                "query_text_index": i,
+                "query_text": df.iloc[i][TEXT_COLUMN],
+                "groundtruth_image_path": df.iloc[i]["resolved_image_path"],
+                "groundtruth_rank": int(gt_rank),
+                "groundtruth_score": float(gt_score),
+                "top_image_predictions": [],
+            }
+
+            for rank, image_idx in enumerate(top_indices, start=1):
+                item["top_image_predictions"].append(
+                    {
+                        "rank": rank,
+                        "image_index": int(image_idx),
+                        "score": float(logits[i, image_idx].item()),
+                        "is_groundtruth": image_idx == i,
+                        "image_path": df.iloc[image_idx]["resolved_image_path"],
+                        "matched_text_for_that_image": df.iloc[image_idx][TEXT_COLUMN],
+                    }
+                )
+
+        else:
+            raise ValueError(f"Unknown direction: {direction}")
+
+        results.append(item)
+
+    return results
 
 @torch.no_grad()
 def evaluate(model: DINOv3BGECLIP, loader: DataLoader, device: torch.device, split_name: str):
@@ -453,8 +583,11 @@ def evaluate(model: DINOv3BGECLIP, loader: DataLoader, device: torch.device, spl
     metrics.update(retrieval_metrics_from_logits(logits_cpu.t(), "t2i"))
 
     metrics["mean_R@1"] = 0.5 * (metrics["i2t_R@1"] + metrics["t2i_R@1"])
-    metrics["mean_R@5"] = 0.5 * (metrics["i2t_R@5"] + metrics["t2i_R@5"])
     metrics["mean_R@10"] = 0.5 * (metrics["i2t_R@10"] + metrics["t2i_R@10"])
+    metrics["mean_R@50"] = 0.5 * (metrics["i2t_R@50"] + metrics["t2i_R@50"])
+    metrics["mean_R@100"] = 0.5 * (metrics["i2t_R@100"] + metrics["t2i_R@100"])
+    metrics["mean_R@250"] = 0.5 * (metrics["i2t_R@250"] + metrics["t2i_R@250"])
+    metrics["mean_R@500"] = 0.5 * (metrics["i2t_R@500"] + metrics["t2i_R@500"])
 
     return metrics
 
@@ -463,11 +596,25 @@ def print_metrics(metrics: dict):
     print(
         f"[{metrics['split']}] "
         f"loss={metrics['loss']:.4f} | "
-        f"I2T R@1={metrics['i2t_R@1']:.4f} R@5={metrics['i2t_R@5']:.4f} R@10={metrics['i2t_R@10']:.4f} | "
-        f"T2I R@1={metrics['t2i_R@1']:.4f} R@5={metrics['t2i_R@5']:.4f} R@10={metrics['t2i_R@10']:.4f} | "
-        f"mean_R@1={metrics['mean_R@1']:.4f}"
+        f"I2T R@1={metrics['i2t_R@1']:.4f} "
+        f"R@10={metrics['i2t_R@10']:.4f} "
+        f"R@50={metrics['i2t_R@50']:.4f} "
+        f"R@100={metrics['i2t_R@100']:.4f} "
+        f"R@250={metrics['i2t_R@250']:.4f} "
+        f"R@500={metrics['i2t_R@500']:.4f} | "
+        f"T2I R@1={metrics['t2i_R@1']:.4f} "
+        f"R@10={metrics['t2i_R@10']:.4f} "
+        f"R@50={metrics['t2i_R@50']:.4f} "
+        f"R@100={metrics['t2i_R@100']:.4f} "
+        f"R@250={metrics['t2i_R@250']:.4f} "
+        f"R@500={metrics['t2i_R@500']:.4f} | "
+        f"mean_R@1={metrics['mean_R@1']:.4f} "
+        f"mean_R@10={metrics['mean_R@10']:.4f} "
+        f"mean_R@50={metrics['mean_R@50']:.4f} "
+        f"mean_R@100={metrics['mean_R@100']:.4f} "
+        f"mean_R@250={metrics['mean_R@250']:.4f} "
+        f"mean_R@500={metrics['mean_R@500']:.4f}"
     )
-
 
 # ============================================================
 # Checkpointing
@@ -532,7 +679,59 @@ def append_jsonl(path: Path, obj: dict):
 # ============================================================
 # Train
 # ============================================================
+def debug_bad_retrieval(
+    logits: torch.Tensor,
+    query_items: list[str],
+    target_items: list[str],
+    direction_name: str,
+    query_label: str,
+    target_label: str,
+    epoch: int,
+    step: int,
+    top_k: int = 10,
+):
+    """
+    logits shape: [num_queries, num_targets]
+    Row i is query i.
+    Column j is candidate target j.
+    Correct match is assumed to be diagonal: i == j.
+    """
+    labels = torch.arange(logits.size(0), device=logits.device)
 
+    sorted_indices = torch.argsort(logits, dim=1, descending=True)
+    ranks = (sorted_indices == labels[:, None]).nonzero(as_tuple=False)[:, 1] + 1
+
+    bad = torch.where(ranks > 1)[0]
+    if len(bad) == 0:
+        return
+
+    # Pick the worst bad example instead of just the first bad example.
+    worst_pos = torch.argmax(ranks[bad])
+    i = bad[worst_pos].item()
+
+    gt_rank = ranks[i].item()
+    top = sorted_indices[i, :top_k].detach().cpu().tolist()
+
+    print("\n" + "=" * 80)
+    print(f"Bad {direction_name} train example, epoch={epoch}, step={step}")
+    print(f"{query_label} row in batch: {i}")
+    print(f"Ground-truth rank within batch: {gt_rank}")
+
+    print(f"\nQuery {query_label}:")
+    print(query_items[i])
+
+    print(f"\nGround-truth {target_label}:")
+    print(target_items[i])
+
+    print(f"\nTop {target_label} predictions in this batch:")
+    for rank, j in enumerate(top, start=1):
+        score = logits[i, j].item()
+        marker = " <-- ground truth" if j == i else ""
+        print(f"\nRank {rank} | batch {target_label} row {j} | score={score:.4f}{marker}")
+        print(target_items[j])
+
+    print("=" * 80 + "\n")
+    
 def train_one_epoch(
     model: DINOv3BGECLIP,
     loader: DataLoader,
@@ -553,12 +752,46 @@ def train_one_epoch(
     pbar = tqdm(loader, desc=f"Epoch {epoch}", leave=True)
 
     for step, batch in enumerate(pbar):
+        metadata = {
+            "image_paths": batch.pop("image_paths"),
+            "texts": batch.pop("texts"),
+        }
+
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
 
         with torch.cuda.amp.autocast(enabled=(USE_AMP and device.type == "cuda"), dtype=amp_dtype):
             image_embeds, text_embeds = model(**batch)
-            loss, _ = contrastive_loss(model, image_embeds, text_embeds)
+            loss, logits_per_image = contrastive_loss(model, image_embeds, text_embeds)
             loss_for_backward = loss / GRAD_ACCUM_STEPS
+            
+        # Debug bad within-batch predictions occasionally.
+        # I2T: image -> text
+        # T2I: text -> image
+        if step % 100 == 0:
+            with torch.no_grad():
+                debug_bad_retrieval(
+                    logits=logits_per_image,
+                    query_items=metadata["image_paths"],
+                    target_items=metadata["texts"],
+                    direction_name="I2T image-to-text",
+                    query_label="image",
+                    target_label="text",
+                    epoch=epoch,
+                    step=step,
+                    top_k=10,
+                )
+
+                debug_bad_retrieval(
+                    logits=logits_per_image.t(),
+                    query_items=metadata["texts"],
+                    target_items=metadata["image_paths"],
+                    direction_name="T2I text-to-image",
+                    query_label="text",
+                    target_label="image",
+                    epoch=epoch,
+                    step=step,
+                    top_k=10,
+                )
 
         scaler.scale(loss_for_backward).backward()
 
@@ -734,11 +967,12 @@ def main():
         }
         append_jsonl(log_path, log_obj)
 
+        # Save this epoch permanently
         save_checkpoint(
             model=model,
             image_processor=image_processor,
             tokenizer=tokenizer,
-            path=out_dir / "last",
+            path=out_dir / f"epoch_{epoch:03d}",
             epoch=epoch,
             global_step=global_step,
             metrics=val_metrics,
@@ -770,6 +1004,19 @@ def main():
     test_metrics = evaluate(model, test_loader, device, split_name="test")
     print_metrics(test_metrics)
 
+    bad_examples = inspect_bad_predictions_both(
+        model=model,
+        loader=test_loader,
+        df=test_df,
+        device=device,
+        split_name="test",
+        top_k=10,
+        max_examples=50,
+    )
+
+    with open(out_dir / "test_bad_predictions.json", "w", encoding="utf-8") as f:
+        json.dump(bad_examples, f, ensure_ascii=False, indent=2)
+
     with open(out_dir / "test_metrics.json", "w", encoding="utf-8") as f:
         json.dump(test_metrics, f, ensure_ascii=False, indent=2)
 
@@ -782,7 +1029,7 @@ def main():
     )
 
     print(f"Best checkpoint: {out_dir / 'best'}")
-    print(f"Last checkpoint: {out_dir / 'last'}")
+    print(f"Bad predictions: {out_dir / 'test_bad_predictions.json'}")
     print(f"Test metrics:    {out_dir / 'test_metrics.json'}")
 
 
